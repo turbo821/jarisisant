@@ -2,24 +2,102 @@
 
 from __future__ import annotations
 
+import ctypes
 import queue
 import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
-from tkinter.scrolledtext import ScrolledText
 
 from .agent import Agent
 from .providers import ProviderError
 
 TITLE = "Jarisisant"
 
+BG = "#1e1f22"
+PANEL = "#2b2d31"
+PANEL_HOVER = "#383a40"
+BORDER = "#3a3d44"
+TEXT = "#e6e7ea"
+MUTED = "#8b8f98"
+ACCENT = "#6ea8fe"
+ACCENT_HOVER = "#8fbcff"
+ON_ACCENT = "#0b1220"
+BOT = "#7ee0a1"
+ERROR = "#f28b82"
+SELECTION = "#3b5b8c"
+
+FONT = ("Segoe UI", 11)
+FONT_BOLD = ("Segoe UI", 10, "bold")
+FONT_SMALL = ("Segoe UI", 9)
+HINT = "Enter: отправить  ·  Shift+Enter: новая строка"
+
+# Tk узнаёт Ctrl+V/C/X по букве, поэтому в русской раскладке (Ctrl+М/С/Ч) они не срабатывают.
+# Код физической клавиши от раскладки не зависит.
+_KEY_A, _KEY_C, _KEY_V, _KEY_X = 65, 67, 86, 88
+_CLIPBOARD_EVENTS = {_KEY_C: "<<Copy>>", _KEY_V: "<<Paste>>", _KEY_X: "<<Cut>>"}
+
+
+def _ctrl_action(keycode: int, keysym: str) -> str | None:
+    """Что сделать по Ctrl+клавиша: "select_all", имя события буфера обмена или None."""
+    if keycode == _KEY_A:
+        return "select_all"
+    if keysym.lower() in ("c", "v", "x"):
+        return None  # латинская раскладка: Tk обработает сам
+    return _CLIPBOARD_EVENTS.get(keycode)
+
+
+def _enable_shortcuts(widget: tk.Text) -> None:
+    """Ctrl+C/V/X/A в любой раскладке и меню по правой кнопке мыши."""
+
+    def on_ctrl_key(event):
+        action = _ctrl_action(event.keycode, event.keysym)
+        if action is None:
+            return None
+        if action == "select_all":
+            widget.tag_add("sel", "1.0", "end-1c")
+        else:
+            widget.event_generate(action)
+        return "break"
+
+    widget.bind("<Control-KeyPress>", on_ctrl_key)
+
+    editable = str(widget.cget("state")) == "normal"
+    menu = tk.Menu(
+        widget, tearoff=0, bg=PANEL, fg=TEXT, activebackground=ACCENT,
+        activeforeground=ON_ACCENT, borderwidth=0,
+    )
+    if editable:
+        menu.add_command(label="Вырезать", command=lambda: widget.event_generate("<<Cut>>"))
+    menu.add_command(label="Копировать", command=lambda: widget.event_generate("<<Copy>>"))
+    if editable:
+        menu.add_command(label="Вставить", command=lambda: widget.event_generate("<<Paste>>"))
+
+    def on_right_click(event):
+        widget.focus_set()
+        menu.tk_popup(event.x_root, event.y_root)
+
+    widget.bind("<Button-3>", on_right_click)
+
+
+def _flat_button(parent, text: str, command, accent: bool = False) -> tk.Button:
+    normal, hover, fg = (ACCENT, ACCENT_HOVER, ON_ACCENT) if accent else (PANEL, PANEL_HOVER, TEXT)
+    button = tk.Button(
+        parent, text=text, command=command, bg=normal, fg=fg, activebackground=hover,
+        activeforeground=fg, disabledforeground=MUTED, relief="flat", borderwidth=0,
+        font=FONT_BOLD if accent else FONT_SMALL, padx=14, pady=6, cursor="hand2",
+    )
+    button.bind("<Enter>", lambda _: button.configure(bg=hover))
+    button.bind("<Leave>", lambda _: button.configure(bg=normal))
+    return button
+
 
 class App:
     def __init__(self, smoke: bool = False):
         self.root = tk.Tk()
         self.root.title(TITLE)
-        self.root.geometry("560x680")
-        self.root.minsize(380, 420)
+        self.root.geometry("600x720")
+        self.root.minsize(400, 440)
+        self.root.configure(bg=BG)
 
         # Всё, что приходит из других потоков, идёт через очередь в главный поток.
         self.events: queue.Queue = queue.Queue()
@@ -27,62 +105,136 @@ class App:
         self.agent = Agent(confirm=self._confirm, on_tool=lambda t: self.events.put(("tool", t)))
 
         self._build_ui()
+        self._dark_title_bar()
         self.tray = self._start_tray()
         self.root.protocol("WM_DELETE_WINDOW", self._hide if self.tray else self._quit)
         self.root.after(100, self._pump)
-        self._say("info", f"Модель: {self.agent.profile.label}. Закрытие окна сворачивает в трей.")
+        self._say("info", "Закрытие окна сворачивает ассистента в трей.")
         if smoke:
             self.root.after(1500, self._quit)
 
     # ---------- интерфейс ----------
 
     def _build_ui(self) -> None:
-        top = ttk.Frame(self.root, padding=(10, 10, 10, 4))
-        top.pack(fill="x")
-        ttk.Label(top, text="Модель:").pack(side="left")
-        self._labels = {p.label: key for key, p in self.agent.profiles.items()}
-        self.model_box = ttk.Combobox(top, state="readonly", values=list(self._labels), width=26)
-        self.model_box.set(self.agent.profile.label)
-        self.model_box.bind("<<ComboboxSelected>>", self._on_model_picked)
-        self.model_box.pack(side="left", padx=8)
-        ttk.Button(top, text="Новый диалог", command=self._new_chat).pack(side="right")
+        top = tk.Frame(self.root, bg=BG)
+        top.pack(fill="x", padx=14, pady=(12, 6))
+        tk.Label(top, text="Модель", bg=BG, fg=MUTED, font=FONT_SMALL).pack(side="left")
 
-        self.chat = ScrolledText(self.root, wrap="word", state="disabled", font=("Segoe UI", 11))
-        self.chat.pack(fill="both", expand=True, padx=10, pady=4)
-        self.chat.tag_configure("user", foreground="#1d4ed8", spacing1=8)
-        self.chat.tag_configure("assistant", spacing1=4)
-        self.chat.tag_configure("tool", foreground="#6b7280", font=("Consolas", 9))
-        self.chat.tag_configure("info", foreground="#6b7280", font=("Segoe UI", 9, "italic"))
-        self.chat.tag_configure("error", foreground="#b91c1c")
+        self.model_var = tk.StringVar(value=self.agent.profile_key)
+        self.model_button = tk.Menubutton(
+            top, bg=PANEL, fg=TEXT, activebackground=PANEL_HOVER, activeforeground=TEXT,
+            relief="flat", borderwidth=0, font=FONT_SMALL, padx=12, pady=6, cursor="hand2",
+        )
+        model_menu = tk.Menu(
+            self.model_button, tearoff=0, bg=PANEL, fg=TEXT, activebackground=ACCENT,
+            activeforeground=ON_ACCENT, selectcolor=TEXT, borderwidth=0,
+        )
+        for key, profile in self.agent.profiles.items():
+            model_menu.add_radiobutton(
+                label=profile.label, value=key, variable=self.model_var,
+                command=lambda key=key: self._set_profile(key),
+            )
+        self.model_button.configure(menu=model_menu)
+        self.model_button.pack(side="left", padx=10)
+        _flat_button(top, "Новый диалог", self._new_chat).pack(side="right")
 
-        bottom = ttk.Frame(self.root, padding=(10, 4, 10, 10))
-        bottom.pack(fill="x")
-        self.entry = ttk.Entry(bottom, font=("Segoe UI", 11))
-        self.entry.pack(side="left", fill="x", expand=True)
-        self.entry.bind("<Return>", lambda _: self._send())
-        self.send_button = ttk.Button(bottom, text="Отправить", command=self._send)
-        self.send_button.pack(side="left", padx=(8, 0))
+        # Нижняя часть упакована раньше чата, чтобы при сжатии окна поле ввода не пропадало.
+        bottom = tk.Frame(self.root, bg=BG)
+        bottom.pack(side="bottom", fill="x", padx=14, pady=(6, 12))
+        self.hint = tk.Label(bottom, text=HINT, bg=BG, fg=MUTED, font=("Segoe UI", 8), anchor="w")
+        self.hint.pack(side="bottom", fill="x", pady=(6, 0))
+        self.send_button = _flat_button(bottom, "Отправить", self._send, accent=True)
+        self.send_button.pack(side="right", fill="y", padx=(8, 0))
+        input_box = tk.Frame(bottom, bg=PANEL, highlightthickness=1, highlightbackground=BORDER,
+                             highlightcolor=ACCENT)
+        input_box.pack(side="left", fill="x", expand=True)
+        self.entry = tk.Text(
+            input_box, height=3, wrap="word", bg=PANEL, fg=TEXT, insertbackground=TEXT,
+            selectbackground=SELECTION, selectforeground=TEXT, relief="flat", borderwidth=0,
+            highlightthickness=0, font=FONT, padx=10, pady=8, undo=True,
+        )
+        self.entry.pack(fill="both", expand=True)
+        self.entry.bind("<Return>", self._on_enter)
+        self.entry.bind("<Shift-Return>", lambda _: None)  # обычный перенос строки
+        _enable_shortcuts(self.entry)
+
+        middle = tk.Frame(self.root, bg=BG)
+        middle.pack(fill="both", expand=True, padx=(14, 6), pady=4)
+        style = ttk.Style(self.root)
+        style.theme_use("clam")
+        style.configure(
+            "Dark.Vertical.TScrollbar", background=PANEL_HOVER, troughcolor=BG, bordercolor=BG,
+            lightcolor=PANEL_HOVER, darkcolor=PANEL_HOVER, arrowcolor=MUTED, relief="flat",
+        )
+        style.map("Dark.Vertical.TScrollbar", background=[("active", MUTED)])
+        scrollbar = ttk.Scrollbar(middle, orient="vertical", style="Dark.Vertical.TScrollbar")
+        scrollbar.pack(side="right", fill="y")
+        self.chat = tk.Text(
+            middle, wrap="word", state="disabled", bg=BG, fg=TEXT, relief="flat", borderwidth=0,
+            highlightthickness=0, font=FONT, padx=4, pady=4, spacing3=2, cursor="arrow",
+            selectbackground=SELECTION, selectforeground=TEXT, yscrollcommand=scrollbar.set,
+        )
+        self.chat.pack(side="left", fill="both", expand=True)
+        scrollbar.configure(command=self.chat.yview)
+        self.chat.tag_configure("name_user", foreground=ACCENT, font=FONT_BOLD, spacing1=14)
+        self.chat.tag_configure("name_bot", foreground=BOT, font=FONT_BOLD, spacing1=14)
+        self.chat.tag_configure("tool", foreground=MUTED, font=("Consolas", 9), lmargin1=10)
+        self.chat.tag_configure("info", foreground=MUTED, font=("Segoe UI", 9, "italic"), spacing1=6)
+        self.chat.tag_configure("error", foreground=ERROR, spacing1=6)
+        _enable_shortcuts(self.chat)
+
+        self._refresh_model_button()
         self.entry.focus_set()
 
-    def _say(self, tag: str, text: str) -> None:
+    def _dark_title_bar(self) -> None:
+        """Тёмный заголовок окна в Windows 10/11; на других системах просто ничего не делает."""
+        try:
+            self.root.update_idletasks()
+            window = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            enabled = ctypes.c_int(1)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                window, 20, ctypes.byref(enabled), ctypes.sizeof(enabled)
+            )
+        except (AttributeError, OSError):
+            pass
+
+    def _refresh_model_button(self) -> None:
+        self.model_button.configure(text=self.agent.profile.label + "  ▾")
+        self.model_var.set(self.agent.profile_key)
+
+    def _say(self, kind: str, text: str) -> None:
         self.chat.configure(state="normal")
-        self.chat.insert("end", text + "\n", tag)
+        if kind == "user":
+            self.chat.insert("end", "Вы\n", "name_user")
+            self.chat.insert("end", text + "\n")
+        elif kind == "assistant":
+            self.chat.insert("end", TITLE + "\n", "name_bot")
+            self.chat.insert("end", text + "\n")
+        else:
+            self.chat.insert("end", text + "\n", kind)
         self.chat.configure(state="disabled")
         self.chat.see("end")
 
     def _set_busy(self, busy: bool) -> None:
         self.busy = busy
         self.send_button.configure(state="disabled" if busy else "normal")
-        self.root.title(f"{TITLE} (думает...)" if busy else TITLE)
+        self.hint.configure(
+            text=f"{self.agent.profile.label} думает..." if busy else HINT,
+            fg=ACCENT if busy else MUTED,
+        )
 
     # ---------- действия ----------
 
+    def _on_enter(self, _event) -> str:
+        self._send()
+        return "break"  # иначе в поле ввода останется перенос строки
+
     def _send(self) -> None:
-        text = self.entry.get().strip()
+        text = self.entry.get("1.0", "end").strip()
         if self.busy or not text:
             return
-        self.entry.delete(0, "end")
-        self._say("user", "Вы: " + text)
+        self.entry.delete("1.0", "end")
+        self._say("user", text)
         self._set_busy(True)
         threading.Thread(target=self._work, args=(text,), daemon=True).start()
 
@@ -107,7 +259,7 @@ class App:
             elif kind == "done":
                 self._set_busy(False)
             elif kind == "tool":
-                self._say("tool", "  > " + payload)
+                self._say("tool", "> " + payload)
             else:
                 self._say(kind, payload)
         self.root.after(100, self._pump)
@@ -126,17 +278,14 @@ class App:
         answered.wait()
         return answer["ok"]
 
-    def _on_model_picked(self, _event=None) -> None:
-        self._set_profile(self._labels[self.model_box.get()])
-
     def _set_profile(self, key: str) -> None:
-        if key == self.agent.profile_key:
-            return
+        changed = key != self.agent.profile_key
         self.agent.profile_key = key
-        self.model_box.set(self.agent.profile.label)
-        self._say("info", f"Модель: {self.agent.profile.label}")
-        if self.tray:
-            self.tray.update_menu()
+        self._refresh_model_button()
+        if changed:
+            self._say("info", f"Модель: {self.agent.profile.label}")
+            if self.tray:
+                self.tray.update_menu()
 
     def _new_chat(self) -> None:
         if self.busy:
@@ -145,7 +294,7 @@ class App:
         self.chat.configure(state="normal")
         self.chat.delete("1.0", "end")
         self.chat.configure(state="disabled")
-        self._say("info", f"Новый диалог. Модель: {self.agent.profile.label}")
+        self._say("info", "Новый диалог.")
 
     # ---------- окно и трей ----------
 
