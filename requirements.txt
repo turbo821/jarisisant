@@ -1,0 +1,6 @@
+openai>=3.49
+anthropic>=2.8
+python-dotenv>=1.2
+Send2Trash>=2.1
+pystray>=0.19
+pillow>=13.0
